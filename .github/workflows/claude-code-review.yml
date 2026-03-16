@@ -1,0 +1,180 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  workflow_run:
+    workflows:
+      - "Auto-create PR for Claude Branches"
+      - "Claude CI Fix"
+    types: [completed]
+  repository_dispatch:
+    types: [claude-code-review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: string
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number || github.event.workflow_run.head_branch || github.event.client_payload.pr_number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    if: |
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'repository_dispatch' ||
+      (startsWith(github.event.workflow_run.head_branch, 'claude/') &&
+       github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+      checks: write
+
+    steps:
+      - name: Get PR info
+        id: setup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR="${{ github.event.pull_request.number }}"
+            SHA="${{ github.event.pull_request.head.sha }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR="${{ inputs.pr_number }}"
+            SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+          elif [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            PR="${{ github.event.client_payload.pr_number }}"
+            SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+          else
+            SHA="${{ github.event.workflow_run.head_sha }}"
+            PR=$(gh pr list --repo "$REPO" --state open --json number,headRefOid \
+              --jq ".[] | select(.headRefOid == \"$SHA\") | .number" | head -1)
+            [ -z "$PR" ] && { echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          fi
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+          echo "event=${{ github.event_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create check run
+        id: check_run
+        if: steps.setup.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ID=$(gh api repos/${{ github.repository }}/check-runs \
+            --method POST \
+            -f name="Claude Code Review" \
+            -f head_sha=${{ steps.setup.outputs.sha }} \
+            -f status=in_progress \
+            --jq '.id')
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        if: steps.setup.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.setup.outputs.sha }}
+
+      - name: Setup dev environment
+        if: steps.setup.outputs.skip != 'true'
+        uses: ./.github/actions/setup-dev-env
+
+      - name: Get diff and skipped issues
+        if: steps.setup.outputs.skip != 'true'
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.setup.outputs.pr }}
+        run: |
+          DIFF=$(git diff $(git merge-base HEAD origin/master) | head -c 100000)
+          { echo "content<<DIFF_EOF"; printf '%s\n' "$DIFF"; echo "DIFF_EOF"; } >> "$GITHUB_OUTPUT"
+
+          # Skipped = body of any thumbsdown'd or hooray'd review-issue comment (across all rounds)
+          ALL_ISSUE_IDS=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '[.[] | select(.body | contains("<!-- claude-review-issue -->")) | .id | tostring] | .[]')
+
+          SKIPPED=""
+          for CID in $ALL_ISSUE_IDS; do
+            REACTIONS=$(gh api "repos/$REPO/issues/comments/$CID/reactions" --jq '[.[].content]')
+            HAS_THUMBSDOWN=$(echo "$REACTIONS" | jq 'any(.[]; . == "-1")')
+            HAS_HOORAY=$(echo "$REACTIONS" | jq 'any(.[]; . == "hooray")')
+            if [ "$HAS_THUMBSDOWN" = "true" ] || [ "$HAS_HOORAY" = "true" ]; then
+              BODY=$(gh api "repos/$REPO/issues/comments/$CID" --jq '.body')
+              SKIPPED="${SKIPPED}${BODY}\n\n"
+            fi
+          done
+
+          if [ -n "$SKIPPED" ]; then
+            { echo "skipped<<SKIPPED_EOF"; printf '%b\n' "$SKIPPED"; echo "SKIPPED_EOF"; } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Claude Code Review
+        if: steps.setup.outputs.skip != 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: '*'
+          claude_args: "--dangerously-skip-permissions"
+          prompt: |
+            Review the code changes for PR #${{ steps.setup.outputs.pr }} of ${{ github.repository }}.
+
+            <diff>
+            ${{ steps.diff.outputs.content }}
+            </diff>
+
+            You can read any files in the repository for additional context if needed.
+
+            Write each issue as a separate file in the review_issues/ directory:
+            - review_issues/issue_1.md, review_issues/issue_2.md, etc.
+            - Each file should start with ## Title, then details
+            - If nothing is worth flagging, write review_issues/no_issues.md
+
+            Only flag real issues: bugs, logic errors, security problems. Skip style and nitpicks.
+            ${{ steps.diff.outputs.skipped != '' && format('The following issues were previously reviewed and deliberately not fixed — do not flag them again:{0}{1}', '\n', steps.diff.outputs.skipped) || '' }}
+
+      - name: Post review issues
+        if: steps.setup.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.setup.outputs.pr }}
+          REPO: ${{ github.repository }}
+        run: bash scripts/github/post-review-issues.sh
+
+      - name: Dispatch Claude Code Fix
+        if: steps.setup.outputs.skip != 'true' && steps.setup.outputs.event != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.setup.outputs.pr }}
+        run: |
+          if ls "$GITHUB_WORKSPACE/review_issues"/issue_*.md 2>/dev/null | grep -q .; then
+            BRANCH=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefName -q '.headRefName')
+            gh api "repos/$REPO/dispatches" \
+              --method POST \
+              -f event_type=claude-code-fix \
+              -F client_payload[pr_number]="$PR_NUMBER" \
+              -F client_payload[branch]="$BRANCH"
+          fi
+
+      - name: Complete check run
+        if: always() && steps.check_run.outputs.id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONCLUSION: ${{ job.status }}
+        run: |
+          gh api repos/${{ github.repository }}/check-runs/${{ steps.check_run.outputs.id }} \
+            --method PATCH \
+            -f status=completed \
+            -f conclusion=$CONCLUSION

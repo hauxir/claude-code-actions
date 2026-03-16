@@ -1,0 +1,12 @@
+name: Setup Dev Environment
+description: |
+  Install project-specific dependencies. Customize this for your repo.
+  This stub only sets up Node.js — add your own language runtimes and caches.
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"

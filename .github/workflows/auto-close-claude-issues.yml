@@ -1,0 +1,66 @@
+name: Auto-close Claude Issues
+
+on:
+  workflow_run:
+    workflows:
+      - "Auto-create PR for Claude Branches"
+    types: [completed]
+
+jobs:
+  close-claude-issues:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Close linked Claude-labeled issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.payload.workflow_run.head_sha;
+            const branch = context.payload.workflow_run.head_branch;
+
+            const prs = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+            });
+
+            const pr = prs.data.find(p => p.head.sha === sha);
+            if (!pr) return;
+
+            const body = pr.body || '';
+            const issueNumbers = new Set();
+
+            // Match issue references in PR body: closes/fixes/resolves #N
+            const bodyPattern = /(?:closes?|fixes?|resolves?)\s+#(\d+)/gi;
+            let match;
+            while ((match = bodyPattern.exec(body)) !== null) {
+              issueNumbers.add(parseInt(match[1]));
+            }
+
+            // Match branch name pattern: claude/issue-{number}-...
+            const branchMatch = branch.match(/^claude\/issue-(\d+)-/);
+            if (branchMatch) {
+              issueNumbers.add(parseInt(branchMatch[1]));
+            }
+
+            for (const issueNumber of issueNumbers.values()) {
+              const issue = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+              });
+
+              const labels = issue.data.labels.map(l => l.name);
+              if (labels.includes('claude')) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  state: 'closed',
+                });
+                console.log(`Closed issue #${issueNumber} (has 'claude' label)`);
+              }
+            }

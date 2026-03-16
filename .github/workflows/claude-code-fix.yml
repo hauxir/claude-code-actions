@@ -1,0 +1,136 @@
+name: Claude Code Fix
+
+on:
+  repository_dispatch:
+    types: [claude-code-fix]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to fix'
+        required: true
+        type: string
+
+concurrency:
+  group: claude-fix-${{ github.event.client_payload.branch || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  claude-fix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+      checks: write
+
+    steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/github
+          fetch-depth: 1
+
+      - name: Find PR and open review issues
+        id: setup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number || github.event.client_payload.pr_number }}
+          WORKFLOW_RUN_HEAD_SHA: ''
+        run: bash scripts/github/find-open-review-issues.sh
+
+      - name: Create check run
+        id: check_run
+        if: steps.setup.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA=$(gh pr view ${{ steps.setup.outputs.pr }} --repo ${{ github.repository }} --json headRefOid --jq '.headRefOid')
+          ID=$(gh api repos/${{ github.repository }}/check-runs \
+            --method POST \
+            -f name="Claude Code Fix" \
+            -f head_sha=$SHA \
+            -f status=in_progress \
+            --jq '.id')
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR branch
+        if: steps.setup.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.setup.outputs.branch }}
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup dev environment
+        if: steps.setup.outputs.skip != 'true'
+        uses: ./.github/actions/setup-dev-env
+
+      - name: Run Claude Code Fix
+        if: steps.setup.outputs.skip != 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: '*'
+          prompt: |
+            Fix the following issues for PR #${{ steps.setup.outputs.pr }} of ${{ github.repository }}.
+
+            ${{ steps.setup.outputs.issues }}
+
+            For each issue:
+            - Fix it if it's a real bug or security issue
+            - Use the Write tool to write fix_summary.md with one line per issue: "Issue #N: Fixed - <description>" or "Issue #N: Not fixed - <genuine reason>"
+            - Use the Write tool to write a one-line commit message summarizing the changes to commit_message.txt
+
+            Important: "Not fixed" must have a genuine justification. Do not skip issues to avoid work.
+          claude_args: "--dangerously-skip-permissions"
+
+      - name: Commit and push fixes
+        id: commit
+        if: steps.setup.outputs.skip != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        run: bash scripts/github/commit-and-push.sh
+
+      - name: Post fix summary
+        if: steps.setup.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.setup.outputs.pr }}
+          REPO: ${{ github.repository }}
+          COMMENT_FILE: ${{ github.workspace }}/fix_summary.md
+          MARKER: "<!-- claude-fix-summary -->"
+        run: bash scripts/github/post-pr-comment.sh
+
+      - name: Post reactions on issues
+        if: steps.setup.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_MAP: ${{ steps.setup.outputs.issue_map }}
+          SUMMARY_FILE: ${{ github.workspace }}/fix_summary.md
+        run: bash scripts/github/post-reactions-on-issues.sh
+
+      - name: Dispatch Claude Code Review
+        if: steps.setup.outputs.skip != 'true' && steps.commit.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/dispatches \
+            --method POST \
+            -f event_type=claude-code-review \
+            -F client_payload[pr_number]=${{ steps.setup.outputs.pr }}
+
+      - name: Complete check run
+        if: always() && steps.check_run.outputs.id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONCLUSION: ${{ job.status }}
+        run: |
+          gh api repos/${{ github.repository }}/check-runs/${{ steps.check_run.outputs.id }} \
+            --method PATCH \
+            -f status=completed \
+            -f conclusion=$CONCLUSION

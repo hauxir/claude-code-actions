@@ -1,0 +1,47 @@
+name: Auto-create PR for Claude Branches
+
+on:
+  create:
+
+jobs:
+  create-pr:
+    if: github.ref_type == 'branch' && contains(github.ref, 'claude/issue-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+    steps:
+      - name: Create PR for Claude branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = context.ref.replace('refs/heads/', '');
+            const match = branch.match(/^claude\/issue-(\d+)-/);
+            if (!match) return;
+
+            const issueNumber = parseInt(match[1]);
+
+            const issue = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+            });
+
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: issue.data.title,
+              body: `Closes #${issueNumber}`,
+              head: branch,
+              base: 'master',
+            });
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.data.number,
+              labels: ['claude'],
+            });
+
+            console.log(`Created PR #${pr.data.number} for issue #${issueNumber}`);

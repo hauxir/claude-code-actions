@@ -1,0 +1,136 @@
+name: Claude CI Fix
+
+on:
+  workflow_run:
+    # List your CI workflow names here — Claude will auto-fix failures on claude/* branches.
+    workflows:
+      # Example:
+      # - CI
+      # - Tests
+      # - Lint
+    types: [completed]
+
+concurrency:
+  group: claude-fix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  claude-fix:
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'push' &&
+      startsWith(github.event.workflow_run.head_branch, 'claude/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+      checks: write
+    steps:
+      - name: Find associated PR and check iteration limit
+        id: find-pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = context.payload.workflow_run.head_branch;
+            const prs = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${branch}`,
+              state: 'open'
+            });
+            if (prs.data.length === 0) {
+              core.setOutput('found', 'false');
+              return;
+            }
+            const pr = prs.data[0];
+
+            const maxIterations = 5;
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'claude-ci-fix.yml',
+              branch: branch,
+              per_page: 100
+            });
+            const completedRuns = runs.data.workflow_runs.filter(r => r.conclusion === 'success').length;
+            if (completedRuns >= maxIterations) {
+              core.setOutput('found', 'false');
+              return;
+            }
+
+            core.setOutput('found', 'true');
+            core.setOutput('pr_number', pr.number.toString());
+
+      - name: Create check run
+        id: check_run
+        if: steps.find-pr.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ID=$(gh api repos/${{ github.repository }}/check-runs \
+            --method POST \
+            -f name="Claude CI Fix" \
+            -f head_sha=${{ github.event.workflow_run.head_sha }} \
+            -f status=in_progress \
+            --jq '.id')
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        if: steps.find-pr.outputs.found == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 1
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup dev environment
+        if: steps.find-pr.outputs.found == 'true'
+        uses: ./.github/actions/setup-dev-env
+
+      - name: Get CI logs
+        if: steps.find-pr.outputs.found == 'true'
+        id: logs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+        run: bash scripts/github/get-ci-logs.sh
+
+      - name: Run Claude Code
+        if: steps.find-pr.outputs.found == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          trigger_phrase: "__claude_ci_fix__"
+          allowed_bots: '*'
+          use_bedrock: false
+          prompt: |
+            The "${{ github.event.workflow_run.name }}" CI workflow failed on this PR.
+
+            CI log output:
+            ${{ steps.logs.outputs.content }}
+
+            Fix the issue by editing the necessary files. Use the Write tool to write a one-line commit message summarizing the fix to commit_message.txt. Do not commit or push.
+          claude_args: "--dangerously-skip-permissions"
+
+      - name: Commit and push fixes
+        if: steps.find-pr.outputs.found == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        run: bash scripts/github/commit-and-push.sh
+
+      - name: Complete check run
+        if: always() && steps.check_run.outputs.id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONCLUSION: ${{ job.status }}
+        run: |
+          gh api repos/${{ github.repository }}/check-runs/${{ steps.check_run.outputs.id }} \
+            --method PATCH \
+            -f status=completed \
+            -f conclusion=$CONCLUSION
