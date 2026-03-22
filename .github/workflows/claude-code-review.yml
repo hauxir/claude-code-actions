@@ -152,8 +152,24 @@ jobs:
           REPO: ${{ github.repository }}
         run: bash scripts/github/post-review-issues.sh
 
+      - name: Check if branch is claude-managed
+        if: steps.setup.outputs.skip != 'true'
+        id: branch_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.setup.outputs.pr }}
+        run: |
+          BRANCH=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefName -q '.headRefName')
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          if [[ "$BRANCH" == claude/* ]]; then
+            echo "is_claude=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_claude=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Dispatch Claude Code Fix
-        if: steps.setup.outputs.skip != 'true' && steps.setup.outputs.event != 'pull_request'
+        if: steps.setup.outputs.skip != 'true' && (steps.setup.outputs.event != 'pull_request' || steps.branch_check.outputs.is_claude == 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
